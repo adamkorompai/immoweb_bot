@@ -150,7 +150,7 @@ def append_to_sheet(listing: dict):
             listing.get("bedrooms", ""),
             listing.get("area", ""),
             " | ".join(listing.get("phones", [])),
-            f'=HYPERLINK("{listing.get("url", "")}","Voir annonce")',
+            f'=HYPERLINK("{listing.get("url", "")}";"Voir annonce")',
             "", "", "",  # Appelé, Répondu, Notes
         ], value_input_option="USER_ENTERED")
         log.info("Row appended to Google Sheet.")
