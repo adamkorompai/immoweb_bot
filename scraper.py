@@ -149,10 +149,10 @@ def append_to_sheet(listing: dict):
             listing.get("price", ""),
             listing.get("bedrooms", ""),
             listing.get("area", ""),
-            " | ".join(listing.get("phones", [])),
-            f'=HYPERLINK("{listing.get("url", "")}";"Voir annonce")',
+            "'" + " | ".join(listing.get("phones", [])),
+            listing.get("url", ""),
             "", "", "",  # Appelé, Répondu, Notes
-        ], value_input_option="USER_ENTERED")
+        ])
         log.info("Row appended to Google Sheet.")
     except Exception as e:
         log.error(f"Google Sheet append failed: {e}")
@@ -213,8 +213,8 @@ def fetch_search_results(session) -> list[dict]:
                 continue
             listing_url = link[0].attrib.get("href", "")
 
-            # Type, locality, zip from the canonical listing URL
-            url_m = re.search(r'/classified/([^/]+)/(?:for-rent|a-louer)/([^/]+)/(\d+)/\d+', listing_url)
+            # Type, locality, zip from the canonical listing URL (EN or FR)
+            url_m = re.search(r'/(?:classified|annonce)/([^/]+)/(?:for-rent|a-louer)/([^/]+)/(\d+)/\d+', listing_url)
             if url_m:
                 prop_type = url_m.group(1).replace('-', ' ').title()
                 locality   = url_m.group(2).replace('-', ' ').title()
