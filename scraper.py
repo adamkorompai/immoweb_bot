@@ -13,7 +13,7 @@ from pathlib import Path
 from datetime import datetime
 
 import requests
-from bs4 import BeautifulSoup
+from scrapling.fetchers import StealthySession
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 # ─────────────────────────────────────────────
@@ -25,23 +25,33 @@ TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]  # set in Railway dashbo
 SEEN_FILE = Path("seen_listings.json")            # tracks already-sent listing IDs
 INTERVAL_MINUTES = 30                             # how often to check
 
-# Immoweb search URL for Ixelles rentals — tweak the URL params as needed
-# To customize: go to immoweb.be, set your filters, copy the URL
-SEARCH_URL = (
-    "https://www.immoweb.be/en/search/house-and-apartment/for-rent"
-    "?countries=BE"
-    "&localities=Ixelles"
-    "&orderBy=newest"
-)
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "fr-BE,fr;q=0.9,en;q=0.8",
-}
+# Immoweb search URLs — toutes les communes de Bruxelles, apparts + maisons
+_COMMUNES = [
+    ("anderlecht",          "1070"),
+    ("auderghem",           "1160"),
+    ("berchem-ste-agathe",  "1082"),
+    ("bruxelles",           "1000"),
+    ("etterbeek",           "1040"),
+    ("evere",               "1140"),
+    ("forest",              "1190"),
+    ("ganshoren",           "1083"),
+    ("ixelles",             "1050"),
+    ("jette",               "1090"),
+    ("koekelberg",          "1081"),
+    ("molenbeek-saint-jean","1080"),
+    ("saint-gilles",        "1060"),
+    ("saint-josse-ten-noode","1210"),
+    ("schaerbeek",          "1030"),
+    ("uccle",               "1180"),
+    ("watermael-boitsfort", "1170"),
+    ("woluwe-saint-lambert","1200"),
+    ("woluwe-saint-pierre", "1150"),
+]
+SEARCH_URLS = [
+    f"https://www.immoweb.be/fr/recherche/{prop_type}/a-louer/{commune}/{zip_}?orderBy=newest"
+    for commune, zip_ in _COMMUNES
+    for prop_type in ("appartement", "maison")
+]
 
 # ─────────────────────────────────────────────
 #  LOGGING
@@ -61,11 +71,11 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 PHONE_PATTERNS = [
     # Mobile: 04xx xx xx xx / +32 4xx xx xx xx
-    r"(?:\+32\s?|0032\s?)?4[5-9]\d[\s.\-]?\d{2}[\s.\-]?\d{2}[\s.\-]?\d{2}",
+    r"(?:\+32\s?|0032\s?)4[5-9]\d[\s.\-]?\d{2}[\s.\-]?\d{2}[\s.\-]?\d{2}|(?<!\d)04[5-9]\d[\s.\-]?\d{2}[\s.\-]?\d{2}[\s.\-]?\d{2}(?!\d)",
     # Landline Brussels: 02 xxx xx xx
-    r"(?:\+32\s?|0032\s?)?2[\s.\-]?\d{3}[\s.\-]?\d{2}[\s.\-]?\d{2}",
+    r"(?:\+32\s?|0032\s?)2[\s.\-]?\d{3}[\s.\-]?\d{2}[\s.\-]?\d{2}|(?<!\d)02[\s.\-]?\d{3}[\s.\-]?\d{2}[\s.\-]?\d{2}(?!\d)",
     # Other landlines: 0x xxx xx xx
-    r"0[1-9][\s.\-]?\d{2,3}[\s.\-]?\d{2}[\s.\-]?\d{2}",
+    r"(?<!\d)0[1-9][\s.\-]?\d{2,3}[\s.\-]?\d{2}[\s.\-]?\d{2}(?!\d)",
 ]
 PHONE_REGEX = re.compile("|".join(PHONE_PATTERNS))
 
@@ -73,26 +83,32 @@ PHONE_REGEX = re.compile("|".join(PHONE_PATTERNS))
 def extract_phone_numbers(text: str) -> list[str]:
     """Find all Belgian phone numbers in a block of text."""
     matches = PHONE_REGEX.findall(text)
-    # Clean up whitespace/separators for display
     cleaned = []
     for m in matches:
         m = m.strip()
-        if m and len(re.sub(r"\D", "", m)) >= 8:  # at least 8 digits
+        if m and len(re.sub(r"\D", "", m)) >= 8:
             cleaned.append(m)
-    return list(dict.fromkeys(cleaned))  # deduplicate, preserve order
+    return list(dict.fromkeys(cleaned))
 
 
 # ─────────────────────────────────────────────
-#  SEEN LISTINGS (JSON persistence)
+#  SEEN LISTINGS (JSON persistence with 30-day TTL)
 # ─────────────────────────────────────────────
-def load_seen() -> set:
+SEEN_TTL_DAYS = 30
+
+
+def load_seen() -> dict:
     if SEEN_FILE.exists():
-        return set(json.loads(SEEN_FILE.read_text()))
-    return set()
+        data = json.loads(SEEN_FILE.read_text())
+        if isinstance(data, list):  # migrate old format
+            data = {lid: 0 for lid in data}
+        cutoff = time.time() - SEEN_TTL_DAYS * 86400
+        return {lid: ts for lid, ts in data.items() if ts > cutoff}
+    return {}
 
 
-def save_seen(seen: set):
-    SEEN_FILE.write_text(json.dumps(list(seen), indent=2))
+def save_seen(seen: dict):
+    SEEN_FILE.write_text(json.dumps(seen, indent=2))
 
 
 # ─────────────────────────────────────────────
@@ -117,119 +133,133 @@ def send_telegram(message: str):
 # ─────────────────────────────────────────────
 #  IMMOWEB SCRAPING
 # ─────────────────────────────────────────────
-def fetch_search_results() -> list[dict]:
+def fetch_search_results(session) -> list[dict]:
     """
-    Fetch the Immoweb search page and return a list of listings.
-    Immoweb embeds listing data as JSON in a <script> tag — we extract that.
-    Falls back to HTML parsing if JSON extraction fails.
+    Fetch all 38 Immoweb search pages (19 communes × appartement + maison)
+    and return deduplicated listings sorted by ID descending (newest first).
     """
-    log.info(f"Fetching search results from Immoweb...")
-    try:
-        r = requests.get(SEARCH_URL, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-    except Exception as e:
-        log.error(f"Failed to fetch search page: {e}")
-        return []
+    seen_ids: set[str] = set()
+    listings: list[dict] = []
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    listings = []
-
-    # Strategy 1: extract from embedded JSON (window.dataLayer or classified JSON blobs)
-    for script in soup.find_all("script", type="text/javascript"):
-        text = script.string or ""
-        if '"id"' in text and '"price"' in text and "classified" in text.lower():
-            try:
-                # Try to find the JSON array of results
-                match = re.search(r'"results"\s*:\s*(\[.*?\])\s*[,}]', text, re.DOTALL)
-                if match:
-                    items = json.loads(match.group(1))
-                    for item in items:
-                        listing_id = str(item.get("id", ""))
-                        if listing_id:
-                            listings.append({
-                                "id": listing_id,
-                                "url": f"https://www.immoweb.be/en/classified/{listing_id}",
-                                "price": item.get("price", {}).get("mainValue", "N/A"),
-                                "locality": item.get("property", {}).get("location", {}).get("locality", ""),
-                                "zip": item.get("property", {}).get("location", {}).get("postalCode", ""),
-                                "type": item.get("property", {}).get("type", ""),
-                                "bedrooms": item.get("property", {}).get("bedroomCount", "?"),
-                                "area": item.get("property", {}).get("netHabitableSurface", "?"),
-                            })
-                    if listings:
-                        log.info(f"Extracted {len(listings)} listings from embedded JSON.")
-                        return listings
-            except Exception:
-                pass  # fall through to HTML parsing
-
-    # Strategy 2: HTML parsing fallback
-    cards = soup.select("article.card--result, li.search-results__item")
-    for card in cards:
-        a_tag = card.select_one("a[href*='/classified/']")
-        if not a_tag:
+    for url in SEARCH_URLS:
+        log.info(f"Fetching {url}")
+        try:
+            page = session.fetch(url, network_idle=True)
+            if page.status != 200:
+                log.warning(f"HTTP {page.status} — skipping {url}")
+                continue
+        except Exception as e:
+            log.warning(f"Fetch error for {url}: {e}")
             continue
-        href = a_tag.get("href", "")
-        id_match = re.search(r"/classified/(\d+)", href)
-        if not id_match:
-            continue
-        listing_id = id_match.group(1)
-        price_el = card.select_one("[class*='price']")
-        price = price_el.get_text(strip=True) if price_el else "N/A"
-        listings.append({
-            "id": listing_id,
-            "url": f"https://www.immoweb.be/en/classified/{listing_id}",
-            "price": price,
-            "locality": "Ixelles",
-            "zip": "",
-            "type": "",
-            "bedrooms": "?",
-            "area": "?",
-        })
 
-    log.info(f"Extracted {len(listings)} listings via HTML fallback.")
+        cards = page.css("article[id^='classified_']")
+        log.info(f"  → {len(cards)} cards")
+
+        for card in cards:
+            listing_id = card.attrib.get("id", "").replace("classified_", "")
+            if not listing_id or listing_id in seen_ids:
+                continue
+            seen_ids.add(listing_id)
+
+            link = card.css("h2.card--result__title a")
+            if not link:
+                continue
+            listing_url = link[0].attrib.get("href", "")
+
+            # Type, locality, zip from the canonical listing URL
+            url_m = re.search(r'/classified/([^/]+)/(?:for-rent|a-louer)/([^/]+)/(\d+)/\d+', listing_url)
+            if url_m:
+                prop_type = url_m.group(1).replace('-', ' ').title()
+                locality   = url_m.group(2).replace('-', ' ').title()
+                zip_code   = url_m.group(3)
+            else:
+                prop_type, locality, zip_code = "?", "?", ""
+
+            # Price: screen-reader span inside the price block
+            price = "N/A"
+            price_el = card.css("p.card--result__price .sr-only")
+            if price_el:
+                price_text = (price_el[0].text or "").strip()
+                pm = re.search(r'(\d[\d,]*)', price_text.replace(',', ''))
+                if pm:
+                    price = int(pm.group(1))
+
+            # Bedrooms: screen-reader span in property info
+            bedrooms = "?"
+            for el in card.css(".card__information--property .sr-only"):
+                t = (el.text or "").strip()
+                bm = re.search(r'(\d+)\s*(?:bedroom|chambre)', t)
+                if bm:
+                    bedrooms = int(bm.group(1))
+                    break
+
+            # Area: direct text node before m²
+            area = "?"
+            for t in card.css(".card__information--property::text").getall():
+                t = t.strip()
+                if t and t.isdigit() and len(t) >= 2:
+                    area = t
+                    break
+
+            is_private = len(card.css(".card--result__agency-logo")) == 0
+
+            listings.append({
+                "id": listing_id,
+                "url": listing_url,
+                "price": price,
+                "locality": locality,
+                "zip": zip_code,
+                "type": prop_type,
+                "bedrooms": bedrooms,
+                "area": area,
+                "is_private": is_private,
+            })
+
+    log.info(f"Total: {len(listings)} listings across all communes.")
     return listings
 
 
-def fetch_listing_detail(listing: dict) -> dict:
+def fetch_listing_detail(listing: dict, session) -> dict:
     """
-    Fetch the individual listing page and extract:
-    - Full description text
-    - Phone numbers in the description
-    - Agency or private owner
+    Fetch the individual listing page and extract phone numbers.
+    Prefers window.classified JSON; falls back to regex on visible text.
     """
-    time.sleep(random.uniform(2, 5))  # polite delay
+    time.sleep(random.uniform(2, 5))
     try:
-        r = requests.get(listing["url"], headers=HEADERS, timeout=15)
-        r.raise_for_status()
+        page = session.fetch(listing["url"], network_idle=True)
+        if page.status != 200:
+            log.warning(f"HTTP {page.status} for listing {listing['id']}")
+            return listing
     except Exception as e:
         log.warning(f"Failed to fetch listing {listing['id']}: {e}")
         return listing
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    phones = []
 
-    # Extract description
-    desc_el = soup.select_one(
-        "[class*='description'], [class*='classified__description'], "
-        "section.classified__description, div.classified__description--content"
-    )
-    description = desc_el.get_text(separator=" ", strip=True) if desc_el else ""
+    # Primary: extract from window.classified JSON in script tags
+    for script in page.find_all("script"):
+        js = script.text or ""
+        if "window.classified" not in js:
+            continue
+        m = re.search(r'window\.classified\s*=\s*(\{.+?\});\s*\n', js, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(1))
+                for customer in data.get("customers", []):
+                    for field in ("phoneNumber", "mobileNumber"):
+                        number = customer.get(field)
+                        if number:
+                            phones.append(number)
+            except Exception:
+                pass
+        break
 
-    # Also grab the full page text for phone number hunting
-    full_text = soup.get_text(separator=" ")
+    # Fallback: regex scan of all visible text on the page
+    if not phones:
+        all_text = " ".join(page.css("body ::text").getall())
+        phones = extract_phone_numbers(all_text)
 
-    # Search for phone numbers in description + full page
-    phones = extract_phone_numbers(description + " " + full_text)
-
-    # Try to detect if it's a private owner
-    is_private = False
-    agent_section = soup.select_one("[class*='agency'], [class*='agent'], [class*='advertiser']")
-    if agent_section:
-        agent_text = agent_section.get_text().lower()
-        is_private = "private" in agent_text or "particulier" in agent_text or "eigenaar" in agent_text
-
-    listing["description"] = description[:500] if description else ""
-    listing["phones"] = phones
-    listing["is_private"] = is_private
+    listing["phones"] = list(dict.fromkeys(phones))
     return listing
 
 
@@ -250,7 +280,7 @@ def format_message(listing: dict) -> str:
 
     lines = [
         f"🏠 <b>New listing — {locality} {zip_code}</b>",
-        f"💶 <b>Price:</b> {price} €/month",
+        f"💶 <b>Price:</b> {price}€/month",
         f"🛏 <b>Bedrooms:</b> {bedrooms} | 📐 <b>Area:</b> {area} m²",
         f"📋 <b>Type:</b> {prop_type}",
         f"{owner_tag}",
@@ -269,34 +299,41 @@ def run_scraper():
     log.info("Running scraper job...")
 
     seen = load_seen()
-    listings = fetch_search_results()
-
-    if not listings:
-        log.warning("No listings found. Immoweb may have changed its structure.")
-        return
-
     new_count = 0
     sent_count = 0
 
-    for listing in listings:
-        lid = listing["id"]
-        if lid in seen:
-            continue
+    with StealthySession(headless=True, solve_cloudflare=True) as session:
+        listings = fetch_search_results(session)
 
-        new_count += 1
-        log.info(f"New listing found: {lid} — fetching details...")
-        listing = fetch_listing_detail(listing)
-        phones = listing.get("phones", [])
+        if not listings:
+            log.warning("No listings found. Immoweb may have changed its structure.")
+            save_seen(seen)
+            return
 
-        if phones:
-            log.info(f"  ✅ Phone number found: {phones} — sending to Telegram")
-            message = format_message(listing)
-            send_telegram(message)
-            sent_count += 1
-        else:
-            log.info(f"  ⏭  No phone number in listing {lid} — skipping")
+        for listing in listings:
+            lid = listing["id"]
+            if lid in seen:
+                continue
 
-        seen.add(lid)
+            if not listing.get("is_private", False):
+                log.info(f"  ⏭  Agency listing {lid} — skipping")
+                seen[lid] = time.time()
+                continue
+
+            new_count += 1
+            log.info(f"New private listing found: {lid} — fetching details...")
+            listing = fetch_listing_detail(listing, session)
+            phones = listing.get("phones", [])
+
+            if phones:
+                log.info(f"  ✅ Private owner + phone found: {phones} — sending to Telegram")
+                message = format_message(listing)
+                send_telegram(message)
+                sent_count += 1
+            else:
+                log.info(f"  ⏭  No phone number in listing {lid} — skipping")
+
+            seen[lid] = time.time()
 
     save_seen(seen)
     log.info(f"Done. {new_count} new listings checked, {sent_count} sent to Telegram.")
@@ -306,17 +343,23 @@ def run_scraper():
 #  SCHEDULER ENTRY POINT
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
+    import sys
+    DRY_RUN = "--dry-run" in sys.argv
+
+    if DRY_RUN:
+        log.info("DRY RUN mode — Telegram messages will be printed, not sent.")
+        send_telegram = lambda msg: print("\n--- TELEGRAM MESSAGE ---\n" + msg + "\n------------------------\n")
+
     log.info("🚀 Immoweb scraper starting up...")
     log.info(f"Will check every {INTERVAL_MINUTES} minutes.")
 
-    # Run once immediately on startup
     run_scraper()
 
-    # Then schedule
-    scheduler = BlockingScheduler()
-    scheduler.add_job(run_scraper, "interval", minutes=INTERVAL_MINUTES)
-    log.info("Scheduler started. Press Ctrl+C to stop.")
-    try:
-        scheduler.start()
-    except KeyboardInterrupt:
-        log.info("Scraper stopped.")
+    if not DRY_RUN:
+        scheduler = BlockingScheduler()
+        scheduler.add_job(run_scraper, "interval", minutes=INTERVAL_MINUTES)
+        log.info("Scheduler started. Press Ctrl+C to stop.")
+        try:
+            scheduler.start()
+        except KeyboardInterrupt:
+            log.info("Scraper stopped.")
