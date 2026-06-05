@@ -152,7 +152,7 @@ def append_to_sheet(listing: dict):
             " | ".join(listing.get("phones", [])),
             f'=HYPERLINK("{listing.get("url", "")}","Voir annonce")',
             "", "", "",  # Appelé, Répondu, Notes
-        ])
+        ], value_input_option="USER_ENTERED")
         log.info("Row appended to Google Sheet.")
     except Exception as e:
         log.error(f"Google Sheet append failed: {e}")
