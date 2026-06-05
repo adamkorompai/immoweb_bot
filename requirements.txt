@@ -1,3 +1,5 @@
 scrapling[fetchers]
 requests
 apscheduler
+gspread
+google-auth

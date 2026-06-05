@@ -13,14 +13,18 @@ from pathlib import Path
 from datetime import datetime
 
 import requests
+import gspread
+from google.oauth2.service_account import Credentials
 from scrapling.fetchers import StealthySession
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 # ─────────────────────────────────────────────
 #  CONFIG — edit these before running
 # ─────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]    # set in Railway dashboard
-TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]  # set in Railway dashboard
+TELEGRAM_BOT_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
+GOOGLE_SHEET_ID     = os.environ.get("GOOGLE_SHEET_ID", "")
+GOOGLE_CREDENTIALS  = os.environ.get("GOOGLE_CREDENTIALS", "")
 
 SEEN_FILE = Path("seen_listings.json")            # tracks already-sent listing IDs
 INTERVAL_MINUTES = 30                             # how often to check
@@ -109,6 +113,49 @@ def load_seen() -> dict:
 
 def save_seen(seen: dict):
     SEEN_FILE.write_text(json.dumps(seen, indent=2))
+
+
+# ─────────────────────────────────────────────
+#  GOOGLE SHEETS
+# ─────────────────────────────────────────────
+SHEET_HEADERS = ["Date", "Commune", "Type", "Prix (€)", "Chambres", "Surface (m²)", "Téléphone", "Lien", "Appelé", "Répondu", "Notes"]
+
+def get_sheet():
+    if not GOOGLE_CREDENTIALS or not GOOGLE_SHEET_ID:
+        return None
+    try:
+        creds = Credentials.from_service_account_info(
+            json.loads(GOOGLE_CREDENTIALS),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        client = gspread.authorize(creds)
+        return client.open_by_key(GOOGLE_SHEET_ID).sheet1
+    except Exception as e:
+        log.error(f"Google Sheets connection failed: {e}")
+        return None
+
+
+def append_to_sheet(listing: dict):
+    sheet = get_sheet()
+    if sheet is None:
+        return
+    try:
+        if not sheet.row_values(1):
+            sheet.append_row(SHEET_HEADERS)
+        sheet.append_row([
+            datetime.now().strftime("%d/%m/%Y %H:%M"),
+            listing.get("locality", ""),
+            listing.get("type", ""),
+            listing.get("price", ""),
+            listing.get("bedrooms", ""),
+            listing.get("area", ""),
+            " | ".join(listing.get("phones", [])),
+            f'=HYPERLINK("{listing.get("url", "")}","Voir annonce")',
+            "", "", "",  # Appelé, Répondu, Notes
+        ])
+        log.info("Row appended to Google Sheet.")
+    except Exception as e:
+        log.error(f"Google Sheet append failed: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -329,6 +376,7 @@ def run_scraper():
                 log.info(f"  ✅ Private owner + phone found: {phones} — sending to Telegram")
                 message = format_message(listing)
                 send_telegram(message)
+                append_to_sheet(listing)
                 sent_count += 1
             else:
                 log.info(f"  ⏭  No phone number in listing {lid} — skipping")
