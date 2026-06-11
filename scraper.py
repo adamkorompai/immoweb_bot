@@ -293,6 +293,9 @@ def fetch_listing_detail(listing: dict, session) -> dict:
             try:
                 data = json.loads(m.group(1))
                 for customer in data.get("customers", []):
+                    if customer.get("type") != "PRIVATE":
+                        listing["is_private"] = False
+                        return listing
                     for field in ("phoneNumber", "mobileNumber"):
                         number = customer.get(field)
                         if number:
@@ -370,6 +373,12 @@ def run_scraper():
             new_count += 1
             log.info(f"New private listing found: {lid} — fetching details...")
             listing = fetch_listing_detail(listing, session)
+
+            if not listing.get("is_private", True):
+                log.info(f"  ⏭  Agency confirmed on detail page {lid} — skipping")
+                seen[lid] = time.time()
+                continue
+
             phones = listing.get("phones", [])
 
             if phones:
